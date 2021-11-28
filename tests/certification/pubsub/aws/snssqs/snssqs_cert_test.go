@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/multierr"
 	// Pub/Sub.
 
@@ -24,18 +25,24 @@ import (
 	dapr "github.com/dapr/go-sdk/client"
 	"github.com/dapr/go-sdk/service/common"
 	"github.com/dapr/kit/logger"
-	kit_retry "github.com/dapr/kit/retry"
-
 	// Certification testing runnables
 	"github.com/dapr/components-contrib/tests/certification/embedded"
 	"github.com/dapr/components-contrib/tests/certification/flow"
 	"github.com/dapr/components-contrib/tests/certification/flow/app"
 	"github.com/dapr/components-contrib/tests/certification/flow/dockercompose"
-	"github.com/dapr/components-contrib/tests/certification/flow/network"
 	"github.com/dapr/components-contrib/tests/certification/flow/retry"
 	"github.com/dapr/components-contrib/tests/certification/flow/sidecar"
 	"github.com/dapr/components-contrib/tests/certification/flow/simulate"
 	"github.com/dapr/components-contrib/tests/certification/flow/watcher"
+
+	// AWS libraries
+	"github.com/aws/aws-sdk-go/aws"
+	//"github.com/aws/aws-sdk-go/aws/client"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/session"
+	//"github.com/aws/aws-sdk-go/service/sns"
+	//"github.com/aws/aws-sdk-go/service/sqs"
+	"github.com/aws/aws-sdk-go/service/sts"
 )
 
 const (
@@ -46,16 +53,25 @@ const (
 	appID2            = "app-2"
 	appID3            = "app-3"
 	dockerComposeYAML = "docker-compose.yml"
-	numMessages       = 1000
+	numMessages       = 10
 	appPort           = 8000
 	portOffset        = 2
 	messageKey        = "partitionKey"
-
-	pubsubName = "pubsub.snssqs"
-	topicName  = "topicName"
+	clusterName       = "snssqs"
+	pubsubName        = "snssqs"
+	topicName         = "topicName"
 )
 
-var brokers = []string{"localhost:19092", "localhost:29092", "localhost:39092"}
+func newLocalstackSession() *session.Session {
+	sessionCfg := aws.NewConfig()
+	sessionCfg.Endpoint = aws.String("http://localhost:4566")
+	sessionCfg.Region = aws.String("us-east-1")
+	sessionCfg.Credentials = credentials.NewStaticCredentials("my-accesskey", "my-secretkey", "")
+	sessionCfg.DisableSSL = aws.Bool(true)
+	opts := session.Options{Profile: "default", Config: *sessionCfg}
+	mySession := session.Must(session.NewSessionWithOptions(opts))
+	return mySession
+}
 
 func TestAWSSnsSqs(t *testing.T) {
 	log := logger.NewLogger("dapr.components")
@@ -64,7 +80,7 @@ func TestAWSSnsSqs(t *testing.T) {
 	})
 
 	// For Kafka, we should ensure messages are received in order.
-	consumerGroup1 := watcher.topicNameed()
+	consumerGroup1 := watcher.NewOrdered()
 	// This watcher is across multiple consumers in the same group
 	// so exact ordering is not expected.
 	consumerGroup2 := watcher.NewUnordered()
@@ -147,7 +163,7 @@ func TestAWSSnsSqs(t *testing.T) {
 	// Runnables for testing publishing and consuming
 	// messages reliably when infrastructure and network
 	// interruptions occur.
-	var task flow.AsyncTask
+	/*var task flow.AsyncTask
 	sendMessagesInBackground := func(messages ...*watcher.Watcher) flow.Runnable {
 		return func(ctx flow.Context) error {
 			client := sidecar.GetClient(ctx, sidecarName1)
@@ -200,39 +216,35 @@ func TestAWSSnsSqs(t *testing.T) {
 
 			return nil
 		}
-	}
+	}*/
 
 	flow.New(t, "aws pubsub snssqs certification").
 		// Run Kafka using Docker Compose.
 		Step(dockercompose.Run(clusterName, dockerComposeYAML)).
-		Step("wait for broker sockets",
-			network.WaitForAddresses(5*time.Minute, brokers...)).
 		Step("wait for localstack (AWS) readiness", retry.Do(time.Second, 30, func(ctx flow.Context) error {
-			config := sarama.NewConfig()
-			config.ClientID = "test-consumer"
-			config.Consumer.Return.Errors = true
+			sess := newLocalstackSession()
+			svc := sts.New(sess)
+			input := &sts.GetCallerIdentityInput{}
 
-			// Create new consumer
-			client, err := sarama.NewConsumer(brokers, config)
+			callerIdentityOutput, err := svc.GetCallerIdentity(input)
 			if err != nil {
 				return err
 			}
-			defer client.Close()
 
-			// Ensure the brokers are ready by attempting to consume
-			// a topic partition.
-			_, err = client.ConsumePartition("myTopic", 0, sarama.OffsetOldest)
+			if *callerIdentityOutput.Account != "000000000000" {
+				return fmt.Errorf("account is not as expected: %s", *callerIdentityOutput.Account)
+			}
 
-			return err
+			return nil
 		})).
 		//
 		// Run the application logic above.
 		Step(app.Run(appID1, fmt.Sprintf(":%d", appPort),
 			application(consumerGroup1))).
 		//
-		// Run the Dapr sidecar with the Kafka component.
+		// Run the Dapr sidecar with the pubsub aws snssqs component.
 		Step(sidecar.Run(sidecarName1,
-			embedded.WithComponentsPath("./components/consumer1"),
+			embedded.WithComponentsPath("./components/vanilla"),
 			embedded.WithAppProtocol(runtime.HTTPProtocol, appPort),
 			embedded.WithDaprGRPCPort(runtime.DefaultDaprAPIGRPCPort),
 			embedded.WithDaprHTTPPort(runtime.DefaultDaprHTTPPort),
@@ -254,7 +266,7 @@ func TestAWSSnsSqs(t *testing.T) {
 		// Send messages using the same metadata/message key so we can expect
 		// in-order processing.
 		Step("send and wait", sendRecvTest(metadata, consumerGroup1, consumerGroup2)).
-		//
+		/*//
 		// Run the third application.
 		Step(app.Run(appID3, fmt.Sprintf(":%d", appPort+portOffset*2),
 			application(consumerGroup2))).
@@ -322,6 +334,6 @@ func TestAWSSnsSqs(t *testing.T) {
 		Step("wait", flow.Sleep(3*time.Second)).
 		Step("stop app 2", app.Stop(appID2)).
 		Step("wait", flow.Sleep(30*time.Second)).
-		Step("assert messages", assertMessages(consumerGroup2)).
+		Step("assert messages", assertMessages(consumerGroup2)).*/
 		Run()
 }
