@@ -8,6 +8,9 @@ package snssqs_test
 import (
 	"context"
 	"fmt"
+	//"github.com/cenkalti/backoff/v4"
+	//"github.com/dapr/components-contrib/tests/certification/flow/network"
+	//kit_retry "github.com/dapr/kit/retry"
 	"testing"
 	"time"
 
@@ -80,10 +83,10 @@ func TestAWSSnsSqs(t *testing.T) {
 	})
 
 	// For Kafka, we should ensure messages are received in order.
-	consumerGroup1 := watcher.NewOrdered()
+	unorderedConsumerWatcher := watcher.NewUnordered()
 	// This watcher is across multiple consumers in the same group
 	// so exact ordering is not expected.
-	consumerGroup2 := watcher.NewUnordered()
+	//consumerGroup2 := watcher.NewUnordered()
 
 	// Application logic that tracks messages from a topic.
 	application := func(messages *watcher.Watcher) app.SetupFn {
@@ -94,7 +97,7 @@ func TestAWSSnsSqs(t *testing.T) {
 			// Setup the /orders event handler.
 			return multierr.Combine(
 				s.AddTopicEventHandler(&common.Subscription{
-					PubsubName: "pubsub.snssqs",
+					PubsubName: "snssqs",
 					Topic:      "topicName",
 					Route:      "/orders",
 				}, func(_ context.Context, e *common.TopicEvent) (retry bool, err error) {
@@ -216,31 +219,33 @@ func TestAWSSnsSqs(t *testing.T) {
 
 			return nil
 		}
-	}*/
+	}
+    */
+	waitForSTS := func (ctx flow.Context) error {
+		sess := newLocalstackSession()
+		svc := sts.New(sess)
+		input := &sts.GetCallerIdentityInput{}
+
+		callerIdentityOutput, err := svc.GetCallerIdentity(input)
+		if err != nil {
+			return err
+		}
+
+		if *callerIdentityOutput.Account != "000000000000" {
+			return fmt.Errorf("account is not as expected: %s", *callerIdentityOutput.Account)
+		}
+
+		return nil
+	}
 
 	flow.New(t, "aws pubsub snssqs certification").
 		// Run Kafka using Docker Compose.
 		Step(dockercompose.Run(clusterName, dockerComposeYAML)).
-		Step("wait for localstack (AWS) readiness", retry.Do(time.Second, 30, func(ctx flow.Context) error {
-			sess := newLocalstackSession()
-			svc := sts.New(sess)
-			input := &sts.GetCallerIdentityInput{}
-
-			callerIdentityOutput, err := svc.GetCallerIdentity(input)
-			if err != nil {
-				return err
-			}
-
-			if *callerIdentityOutput.Account != "000000000000" {
-				return fmt.Errorf("account is not as expected: %s", *callerIdentityOutput.Account)
-			}
-
-			return nil
-		})).
+		Step("wait for localstack (AWS) readiness", retry.Do(time.Second, 30, waitForSTS)).
 		//
 		// Run the application logic above.
 		Step(app.Run(appID1, fmt.Sprintf(":%d", appPort),
-			application(consumerGroup1))).
+			application(unorderedConsumerWatcher))).
 		//
 		// Run the Dapr sidecar with the pubsub aws snssqs component.
 		Step(sidecar.Run(sidecarName1,
@@ -252,81 +257,56 @@ func TestAWSSnsSqs(t *testing.T) {
 		//
 		// Run the second application.
 		Step(app.Run(appID2, fmt.Sprintf(":%d", appPort+portOffset),
-			application(consumerGroup2))).
+			application(unorderedConsumerWatcher))).
 		//
 		// Run the Dapr sidecar with the Kafka component.
 		Step(sidecar.Run(sidecarName2,
-			embedded.WithComponentsPath("./components/consumer2"),
+			embedded.WithComponentsPath("./components/vanilla"),
 			embedded.WithAppProtocol(runtime.HTTPProtocol, appPort+portOffset),
 			embedded.WithDaprGRPCPort(runtime.DefaultDaprAPIGRPCPort+portOffset),
 			embedded.WithDaprHTTPPort(runtime.DefaultDaprHTTPPort+portOffset),
 			embedded.WithProfilePort(runtime.DefaultProfilePort+portOffset),
 			runtime.WithPubSubs(component))).
 		//
-		// Send messages using the same metadata/message key so we can expect
-		// in-order processing.
-		Step("send and wait", sendRecvTest(metadata, consumerGroup1, consumerGroup2)).
-		/*//
+		// Send messages using the same metadata/message keys
+		Step("send and wait", sendRecvTest(metadata, unorderedConsumerWatcher)).
+		//
 		// Run the third application.
 		Step(app.Run(appID3, fmt.Sprintf(":%d", appPort+portOffset*2),
-			application(consumerGroup2))).
+			application(unorderedConsumerWatcher))).
 		//
 		// Run the Dapr sidecar with the Kafka component.
 		Step(sidecar.Run(sidecarName3,
-			embedded.WithComponentsPath("./components/consumer2"),
+			embedded.WithComponentsPath("./components/vanilla"),
 			embedded.WithAppProtocol(runtime.HTTPProtocol, appPort+portOffset*2),
 			embedded.WithDaprGRPCPort(runtime.DefaultDaprAPIGRPCPort+portOffset*2),
 			embedded.WithDaprHTTPPort(runtime.DefaultDaprHTTPPort+portOffset*2),
 			embedded.WithProfilePort(runtime.DefaultProfilePort+portOffset*2),
 			runtime.WithPubSubs(component))).
-		Step("reset", flow.Reset(consumerGroup2)).
+		Step("reset", flow.Reset(unorderedConsumerWatcher)).
 		//
 		// Send messages with random keys to test message consumption
 		// across more than one consumer group and consumers per group.
-		Step("send and wait", sendRecvTest(map[string]string{}, consumerGroup2)).
-		//
-		// Gradually stop each broker.
-		// This tests the components ability to handle reconnections
-		// when brokers are shutdown cleanly.
-		StepAsync("steady flow of messages to publish", &task,
-			sendMessagesInBackground(consumerGroup1, consumerGroup2)).
-		Step("wait", flow.Sleep(5*time.Second)).
-		Step("stop broker 1", dockercompose.Stop(clusterName, dockerComposeYAML, "kafka1")).
-		Step("wait", flow.Sleep(5*time.Second)).
-		//
-		// Errors will likely start occurring here since quorum is lost.
-		Step("stop broker 2", dockercompose.Stop(clusterName, dockerComposeYAML, "kafka2")).
-		Step("wait", flow.Sleep(10*time.Second)).
-		//
-		// Errors will definitely occur here.
-		Step("stop broker 3", dockercompose.Stop(clusterName, dockerComposeYAML, "kafka3")).
-		Step("wait", flow.Sleep(30*time.Second)).
-		Step("restart broker 3", dockercompose.Start(clusterName, dockerComposeYAML, "kafka3")).
-		Step("restart broker 2", dockercompose.Start(clusterName, dockerComposeYAML, "kafka2")).
-		Step("restart broker 1", dockercompose.Start(clusterName, dockerComposeYAML, "kafka1")).
-		//
-		// Component should recover at this point.
-		Step("wait", flow.Sleep(30*time.Second)).
-		Step("assert messages", assertMessages(consumerGroup1, consumerGroup2)).
+		Step("send and wait", sendRecvTest(map[string]string{}, unorderedConsumerWatcher)).
 		//
 		// Simulate a network interruption.
 		// This tests the components ability to handle reconnections
 		// when Dapr is disconnected abnormally.
-		StepAsync("steady flow of messages to publish", &task,
-			sendMessagesInBackground(consumerGroup1, consumerGroup2)).
+		/*StepAsync("steady flow of messages to publish", &task,
+			sendMessagesInBackground(unorderedConsumerWatcher)).
 		Step("wait", flow.Sleep(5*time.Second)).
 		//
-		// Errors will occurring here.
+		// Errors will occur here.
 		Step("interrupt network",
-			network.InterruptNetwork(30*time.Second, nil, nil, "19092", "29092", "39092")).
+			network.InterruptNetwork(30*time.Second, nil, nil, "4566")).
 		//
 		// Component should recover at this point.
 		Step("wait", flow.Sleep(30*time.Second)).
-		Step("assert messages", assertMessages(consumerGroup1, consumerGroup2)).
+		Step("assert messages", assertMessages(unorderedConsumerWatcher)).*/
 		//
 		// Reset and test that all messages are received during a
 		// consumer rebalance.
-		Step("reset", flow.Reset(consumerGroup2)).
+		/*Step("reset", flow.Reset(consumerGroup2)).
 		StepAsync("steady flow of messages to publish", &task,
 			sendMessagesInBackground(consumerGroup2)).
 		Step("wait", flow.Sleep(15*time.Second)).
