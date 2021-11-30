@@ -8,9 +8,10 @@ package snssqs_test
 import (
 	"context"
 	"fmt"
-	//"github.com/cenkalti/backoff/v4"
-	//"github.com/dapr/components-contrib/tests/certification/flow/network"
-	//kit_retry "github.com/dapr/kit/retry"
+
+	"github.com/cenkalti/backoff/v4"
+	"github.com/dapr/components-contrib/tests/certification/flow/network"
+	kit_retry "github.com/dapr/kit/retry"
 	"testing"
 	"time"
 
@@ -82,36 +83,8 @@ func TestAWSSnsSqs(t *testing.T) {
 		return pubsub_snssqs.NewSnsSqs(log)
 	})
 
-	// For Kafka, we should ensure messages are received in order.
+	// For snssqs without FIFO, we don't have ordering guarantee
 	unorderedConsumerWatcher := watcher.NewUnordered()
-	// This watcher is across multiple consumers in the same group
-	// so exact ordering is not expected.
-	//consumerGroup2 := watcher.NewUnordered()
-
-	// Application logic that tracks messages from a topic.
-	application := func(messages *watcher.Watcher) app.SetupFn {
-		return func(ctx flow.Context, s common.Service) error {
-			// Simulate periodic errors.
-			sim := simulate.PeriodicError(ctx, 100)
-
-			// Setup the /orders event handler.
-			return multierr.Combine(
-				s.AddTopicEventHandler(&common.Subscription{
-					PubsubName: "snssqs",
-					Topic:      "topicName",
-					Route:      "/orders",
-				}, func(_ context.Context, e *common.TopicEvent) (retry bool, err error) {
-					if err := sim(); err != nil {
-						return true, err
-					}
-
-					// Track/Observe the data of the event.
-					messages.Observe(e.Data)
-					return false, nil
-				}),
-			)
-		}
-	}
 
 	// Set the partition key on all messages so they
 	// are written to the same partition.
@@ -120,8 +93,6 @@ func TestAWSSnsSqs(t *testing.T) {
 		messageKey: "test",
 	}
 
-	// Test logic that sends messages to a topic and
-	// verifies the application has received them.
 	sendRecvTest := func(metadata map[string]string, messages ...*watcher.Watcher) flow.Runnable {
 		_, hasKey := metadata[messageKey]
 		return func(ctx flow.Context) error {
@@ -137,7 +108,6 @@ func TestAWSSnsSqs(t *testing.T) {
 				m.ExpectStrings(msgs...)
 			}
 			// If no key it provided, create a random one.
-			// For Kafka, this will spread messages across
 			// the topic's partitions.
 			if !hasKey {
 				metadata[messageKey] = uuid.NewString()
@@ -166,7 +136,7 @@ func TestAWSSnsSqs(t *testing.T) {
 	// Runnables for testing publishing and consuming
 	// messages reliably when infrastructure and network
 	// interruptions occur.
-	/*var task flow.AsyncTask
+	var task flow.AsyncTask
 	sendMessagesInBackground := func(messages ...*watcher.Watcher) flow.Runnable {
 		return func(ctx flow.Context) error {
 			client := sidecar.GetClient(ctx, sidecarName1)
@@ -220,25 +190,31 @@ func TestAWSSnsSqs(t *testing.T) {
 			return nil
 		}
 	}
-    */
-	waitForSTS := func (ctx flow.Context) error {
-		sess := newLocalstackSession()
-		svc := sts.New(sess)
-		input := &sts.GetCallerIdentityInput{}
+	// Application logic that tracks messages from a topic.
+	application := func(messages *watcher.Watcher) app.SetupFn {
+		return func(ctx flow.Context, s common.Service) error {
+			// Simulate periodic errors.
+			sim := simulate.PeriodicError(ctx, 100)
 
-		callerIdentityOutput, err := svc.GetCallerIdentity(input)
-		if err != nil {
-			return err
+			// Setup the /orders event handler.
+			return multierr.Combine(
+				s.AddTopicEventHandler(&common.Subscription{
+					PubsubName: "snssqs",
+					Topic:      "topicName",
+					Route:      "/orders",
+				}, func(_ context.Context, e *common.TopicEvent) (retry bool, err error) {
+					if err := sim(); err != nil {
+						return true, err
+					}
+					// Track/Observe the data of the event.
+					messages.Observe(e.Data)
+					return false, nil
+				}),
+			)
 		}
-
-		if *callerIdentityOutput.Account != "000000000000" {
-			return fmt.Errorf("account is not as expected: %s", *callerIdentityOutput.Account)
-		}
-
-		return nil
 	}
 
-	flow.New(t, "aws pubsub snssqs certification").
+	flow.New(t, "aws pubsub snssqs certification (unordered)").
 		// Run Kafka using Docker Compose.
 		Step(dockercompose.Run(clusterName, dockerComposeYAML)).
 		Step("wait for localstack (AWS) readiness", retry.Do(time.Second, 30, waitForSTS)).
@@ -292,7 +268,7 @@ func TestAWSSnsSqs(t *testing.T) {
 		// Simulate a network interruption.
 		// This tests the components ability to handle reconnections
 		// when Dapr is disconnected abnormally.
-		/*StepAsync("steady flow of messages to publish", &task,
+		StepAsync("steady flow of messages to publish", &task,
 			sendMessagesInBackground(unorderedConsumerWatcher)).
 		Step("wait", flow.Sleep(5*time.Second)).
 		//
@@ -302,18 +278,136 @@ func TestAWSSnsSqs(t *testing.T) {
 		//
 		// Component should recover at this point.
 		Step("wait", flow.Sleep(30*time.Second)).
-		Step("assert messages", assertMessages(unorderedConsumerWatcher)).*/
-		//
-		// Reset and test that all messages are received during a
-		// consumer rebalance.
-		/*Step("reset", flow.Reset(consumerGroup2)).
-		StepAsync("steady flow of messages to publish", &task,
-			sendMessagesInBackground(consumerGroup2)).
-		Step("wait", flow.Sleep(15*time.Second)).
-		Step("stop sidecar 2", sidecar.Stop(sidecarName2)).
-		Step("wait", flow.Sleep(3*time.Second)).
-		Step("stop app 2", app.Stop(appID2)).
-		Step("wait", flow.Sleep(30*time.Second)).
-		Step("assert messages", assertMessages(consumerGroup2)).*/
+		Step("assert messages", assertMessages(unorderedConsumerWatcher)).
+		Step("stop app1", sidecar.Stop(appID1)).
+		Step("stop app2", sidecar.Stop(appID2)).
+		Step("stop app3", sidecar.Stop(appID3)).
 		Run()
+}
+
+func TestAWSSnsSqsDeadletters(t *testing.T) {
+	log := logger.NewLogger("dapr.components")
+	component := pubsub_loader.New("aws.snssqs", func() pubsub.PubSub {
+		return pubsub_snssqs.NewSnsSqs(log)
+	})
+
+	// For snssqs without FIFO, we don't have ordering guarantee
+	unorderedConsumerWatcher := watcher.NewUnordered()
+
+	// Set the partition key on all messages so they
+	// are written to the same partition.
+	// This allows for checking of ordered messages.
+	metadata := map[string]string{
+		messageKey: "test",
+	}
+
+	sendRecvTest := func(metadata map[string]string, messages ...*watcher.Watcher) flow.Runnable {
+		_, hasKey := metadata[messageKey]
+		return func(ctx flow.Context) error {
+			client := sidecar.GetClient(ctx, sidecarName1)
+
+			// Declare what is expected BEFORE performing any steps
+			// that will satisfy the test.
+			// Here we expect nothing to be present in the ack'ed messages as they would fail
+			msgs := make([]string, numMessages)
+
+			for _, m := range messages {
+				m.ExpectStrings(msgs...)
+			}
+			// If no key it provided, create a random one.
+			// For Kafka, this will spread messages across
+			// the topic's partitions.
+			if !hasKey {
+				metadata[messageKey] = uuid.NewString()
+			}
+
+			// Send events that the receiveFailingApplication above will observe.
+			ctx.Log("Sending messages!")
+			for _, msg := range msgs {
+				ctx.Logf("Sending: %q", msg)
+				err := client.PublishEvent(
+					ctx, pubsubName, topicName, msg,
+					dapr.PublishEventWithMetadata(metadata))
+				require.NoError(ctx, err, "error publishing message")
+			}
+
+			// Do the messages we observed match what we expect?
+			for _, m := range messages {
+				m.Assert(ctx, time.Minute)
+			}
+
+			return nil
+		}
+	}
+
+	// Application logic that tracks messages from a topic.
+	receiveFailingApplication := func(messages *watcher.Watcher) app.SetupFn {
+		return func(ctx flow.Context, s common.Service) error {
+
+			// Setup the /orders event handler.
+			return multierr.Combine(
+				s.AddTopicEventHandler(&common.Subscription{
+					PubsubName: "snssqs",
+					Topic:      "topicName",
+					Route:      "/orders",
+				}, func(_ context.Context, e *common.TopicEvent) (retry bool, err error) {
+
+					// always fail to process message
+					messages.Observe(e.Data)
+					return false, fmt.Errorf("simulating consumer error")
+				}),
+			)
+		}
+	}
+
+	flow.New(t, "aws pubsub snssqs certification (unordered)").
+		// Run Kafka using Docker Compose.
+		Step(dockercompose.Run(clusterName, dockerComposeYAML)).
+		Step("wait for localstack (AWS) readiness", retry.Do(time.Second, 30, waitForSTS)).
+		//
+		// Run the receiveFailingApplication logic above.
+		Step(app.Run(appID1, fmt.Sprintf(":%d", appPort),
+			receiveFailingApplication(unorderedConsumerWatcher))).
+		//
+		// Run the Dapr sidecar with the pubsub aws snssqs component.
+		Step(sidecar.Run(sidecarName1,
+			embedded.WithComponentsPath("./components/vanilla"),
+			embedded.WithAppProtocol(runtime.HTTPProtocol, appPort),
+			embedded.WithDaprGRPCPort(runtime.DefaultDaprAPIGRPCPort),
+			embedded.WithDaprHTTPPort(runtime.DefaultDaprHTTPPort),
+			runtime.WithPubSubs(component))).
+		//
+		// Run the second receiveFailingApplication.
+		Step(app.Run(appID2, fmt.Sprintf(":%d", appPort+portOffset),
+			receiveFailingApplication(unorderedConsumerWatcher))).
+		//
+		// Run the Dapr sidecar with the Kafka component.
+		Step(sidecar.Run(sidecarName2,
+			embedded.WithComponentsPath("./components/vanilla"),
+			embedded.WithAppProtocol(runtime.HTTPProtocol, appPort+portOffset),
+			embedded.WithDaprGRPCPort(runtime.DefaultDaprAPIGRPCPort+portOffset),
+			embedded.WithDaprHTTPPort(runtime.DefaultDaprHTTPPort+portOffset),
+			embedded.WithProfilePort(runtime.DefaultProfilePort+portOffset),
+			runtime.WithPubSubs(component))).
+		//
+		// Send messages using the same metadata/message keys
+		Step("send and wait", sendRecvTest(metadata, unorderedConsumerWatcher)).
+		Run()
+}
+
+func waitForSTS(ctx flow.Context) error {
+	sess := newLocalstackSession()
+	svc := sts.New(sess)
+	input := &sts.GetCallerIdentityInput{}
+
+	callerIdentityOutput, err := svc.GetCallerIdentity(input)
+	if err != nil {
+		return err
+	}
+
+	if *callerIdentityOutput.Account != "000000000000" {
+		return fmt.Errorf("account is not as expected: %s", *callerIdentityOutput.Account)
+	}
+
+	return nil
 }
