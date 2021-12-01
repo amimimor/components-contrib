@@ -9,9 +9,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cenkalti/backoff/v4"
-	"github.com/dapr/components-contrib/tests/certification/flow/network"
-	kit_retry "github.com/dapr/kit/retry"
 	"testing"
 	"time"
 
@@ -36,7 +33,6 @@ import (
 	"github.com/dapr/components-contrib/tests/certification/flow/dockercompose"
 	"github.com/dapr/components-contrib/tests/certification/flow/retry"
 	"github.com/dapr/components-contrib/tests/certification/flow/sidecar"
-	"github.com/dapr/components-contrib/tests/certification/flow/simulate"
 	"github.com/dapr/components-contrib/tests/certification/flow/watcher"
 
 	// AWS libraries
@@ -77,7 +73,7 @@ func newLocalstackSession() *session.Session {
 	return mySession
 }
 
-func TestAWSSnsSqs(t *testing.T) {
+/*func TestAWSSnsSqs(t *testing.T) {
 	log := logger.NewLogger("dapr.components")
 	component := pubsub_loader.New("aws.snssqs", func() pubsub.PubSub {
 		return pubsub_snssqs.NewSnsSqs(log)
@@ -283,7 +279,7 @@ func TestAWSSnsSqs(t *testing.T) {
 		Step("stop app2", sidecar.Stop(appID2)).
 		Step("stop app3", sidecar.Stop(appID3)).
 		Run()
-}
+}*/
 
 func TestAWSSnsSqsDeadletters(t *testing.T) {
 	log := logger.NewLogger("dapr.components")
@@ -293,6 +289,7 @@ func TestAWSSnsSqsDeadletters(t *testing.T) {
 
 	// For snssqs without FIFO, we don't have ordering guarantee
 	unorderedConsumerWatcher := watcher.NewUnordered()
+	dlqUnorderedConsumerWatcher := watcher.NewUnordered()
 
 	// Set the partition key on all messages so they
 	// are written to the same partition.
@@ -310,6 +307,9 @@ func TestAWSSnsSqsDeadletters(t *testing.T) {
 			// that will satisfy the test.
 			// Here we expect nothing to be present in the ack'ed messages as they would fail
 			msgs := make([]string, numMessages)
+			for i := range msgs {
+				msgs[i] = fmt.Sprintf("Hello, Messages %03d", i)
+			}
 
 			for _, m := range messages {
 				m.ExpectStrings(msgs...)
@@ -333,14 +333,14 @@ func TestAWSSnsSqsDeadletters(t *testing.T) {
 
 			// Do the messages we observed match what we expect?
 			for _, m := range messages {
-				m.Assert(ctx, time.Minute)
+				m.Assert(t, time.Minute)
 			}
 
 			return nil
 		}
 	}
 
-	// Application logic that tracks messages from a topic.
+	// Application logic that fails messages from a topic.
 	receiveFailingApplication := func(messages *watcher.Watcher) app.SetupFn {
 		return func(ctx flow.Context, s common.Service) error {
 
@@ -360,6 +360,26 @@ func TestAWSSnsSqsDeadletters(t *testing.T) {
 		}
 	}
 
+	// Application logic that tracks DLQ messages from a topic.
+	application := func(messages *watcher.Watcher) app.SetupFn {
+		return func(ctx flow.Context, s common.Service) error {
+
+			// Setup the /orders event handler.
+			return multierr.Combine(
+				s.AddTopicEventHandler(&common.Subscription{
+					PubsubName: "snssqs",
+					Topic:      "topicName",
+					Route:      "/orders",
+				}, func(_ context.Context, e *common.TopicEvent) (retry bool, err error) {
+					// always fail to process message
+					messages.Observe(e.Data)
+					fmt.Printf("\napplication handled data. source: %s, data: %s, id: %s\n", e.Source, e.Data, e.ID)
+					return false, nil
+				}),
+			)
+		}
+	}
+
 	flow.New(t, "aws pubsub snssqs certification (unordered)").
 		// Run Kafka using Docker Compose.
 		Step(dockercompose.Run(clusterName, dockerComposeYAML)).
@@ -371,7 +391,7 @@ func TestAWSSnsSqsDeadletters(t *testing.T) {
 		//
 		// Run the Dapr sidecar with the pubsub aws snssqs component.
 		Step(sidecar.Run(sidecarName1,
-			embedded.WithComponentsPath("./components/vanilla"),
+			embedded.WithComponentsPath("./components/deadletters/alpha"),
 			embedded.WithAppProtocol(runtime.HTTPProtocol, appPort),
 			embedded.WithDaprGRPCPort(runtime.DefaultDaprAPIGRPCPort),
 			embedded.WithDaprHTTPPort(runtime.DefaultDaprHTTPPort),
@@ -381,17 +401,34 @@ func TestAWSSnsSqsDeadletters(t *testing.T) {
 		Step(app.Run(appID2, fmt.Sprintf(":%d", appPort+portOffset),
 			receiveFailingApplication(unorderedConsumerWatcher))).
 		//
-		// Run the Dapr sidecar with the Kafka component.
+		// Run the Dapr sidecar with the component.
 		Step(sidecar.Run(sidecarName2,
-			embedded.WithComponentsPath("./components/vanilla"),
+			embedded.WithComponentsPath("./components/deadletters/alpha"),
 			embedded.WithAppProtocol(runtime.HTTPProtocol, appPort+portOffset),
 			embedded.WithDaprGRPCPort(runtime.DefaultDaprAPIGRPCPort+portOffset),
 			embedded.WithDaprHTTPPort(runtime.DefaultDaprHTTPPort+portOffset),
 			embedded.WithProfilePort(runtime.DefaultProfilePort+portOffset),
 			runtime.WithPubSubs(component))).
+
+		// Run the third application.
+		Step(app.Run(appID3, fmt.Sprintf(":%d", appPort+portOffset*2),
+			application(dlqUnorderedConsumerWatcher))).
 		//
+		// Run the Dapr sidecar with the component.
+		Step(sidecar.Run(sidecarName3,
+			// using a component that would consume messages sent to the deadletters queue
+			embedded.WithComponentsPath("./components/deadletters/beta"),
+			embedded.WithAppProtocol(runtime.HTTPProtocol, appPort+portOffset*2),
+			embedded.WithDaprGRPCPort(runtime.DefaultDaprAPIGRPCPort+portOffset*2),
+			embedded.WithDaprHTTPPort(runtime.DefaultDaprHTTPPort+portOffset*2),
+			embedded.WithProfilePort(runtime.DefaultProfilePort+portOffset*2),
+			runtime.WithPubSubs(component))).
 		// Send messages using the same metadata/message keys
-		Step("send and wait", sendRecvTest(metadata, unorderedConsumerWatcher)).
+		Step("send and wait", sendRecvTest(metadata, unorderedConsumerWatcher, dlqUnorderedConsumerWatcher)).
+		//Step("wait", flow.Sleep(30*time.Second)).
+		//Step("stop app1", sidecar.Stop(appID1)).
+		//Step("stop app2", sidecar.Stop(appID2)).
+		//Step("stop app3", sidecar.Stop(appID3)).
 		Run()
 }
 

@@ -5,7 +5,7 @@ go 1.17
 require (
 	github.com/aws/aws-sdk-go v1.42.13
 	//github.com/dapr/components-contrib v1.5.0
-	github.com/dapr/components-contrib v1.5.0
+	github.com/dapr/components-contrib master
 	github.com/dapr/components-contrib/tests/certification v0.0.0-00010101000000-000000000000
 	github.com/dapr/dapr v1.5.0
 	github.com/dapr/go-sdk v1.3.0
