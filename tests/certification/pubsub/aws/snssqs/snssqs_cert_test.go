@@ -8,6 +8,10 @@ package snssqs_test
 import (
 	"context"
 	"fmt"
+	"github.com/cenkalti/backoff/v4"
+	"github.com/dapr/components-contrib/tests/certification/flow/network"
+	"github.com/dapr/components-contrib/tests/certification/flow/simulate"
+	kit_retry "github.com/dapr/kit/retry"
 
 	"testing"
 	"time"
@@ -73,7 +77,7 @@ func newLocalstackSession() *session.Session {
 	return mySession
 }
 
-/*func TestAWSSnsSqs(t *testing.T) {
+func TestAWSSnsSqs(t *testing.T) {
 	log := logger.NewLogger("dapr.components")
 	component := pubsub_loader.New("aws.snssqs", func() pubsub.PubSub {
 		return pubsub_snssqs.NewSnsSqs(log)
@@ -279,7 +283,7 @@ func newLocalstackSession() *session.Session {
 		Step("stop app2", sidecar.Stop(appID2)).
 		Step("stop app3", sidecar.Stop(appID3)).
 		Run()
-}*/
+}
 
 func TestAWSSnsSqsDeadletters(t *testing.T) {
 	log := logger.NewLogger("dapr.components")
