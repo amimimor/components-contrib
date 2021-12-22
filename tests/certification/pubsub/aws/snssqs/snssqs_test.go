@@ -8,455 +8,474 @@ package snssqs_test
 import (
 	"context"
 	"fmt"
-	"os"
-	"strconv"
+	"github.com/cenkalti/backoff/v4"
+	"github.com/dapr/components-contrib/tests/certification/flow/simulate"
+	kit_retry "github.com/dapr/kit/retry"
+
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/client"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/sns"
-	"github.com/aws/aws-sdk-go/service/sqs"
-	"github.com/aws/aws-sdk-go/service/sts"
-	"github.com/stretchr/testify/assert"
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/multierr"
+	// Pub/Sub.
 
 	"github.com/dapr/components-contrib/pubsub"
-	snssqs "github.com/dapr/components-contrib/pubsub/aws/snssqs"
+	pubsub_snssqs "github.com/dapr/components-contrib/pubsub/aws/snssqs"
+	pubsub_loader "github.com/dapr/dapr/pkg/components/pubsub"
 
+	// Dapr runtime and Go-SDK
+	"github.com/dapr/dapr/pkg/runtime"
+	dapr "github.com/dapr/go-sdk/client"
+	"github.com/dapr/go-sdk/service/common"
 	"github.com/dapr/kit/logger"
+	// Certification testing runnables
+	"github.com/dapr/components-contrib/tests/certification/embedded"
+	"github.com/dapr/components-contrib/tests/certification/flow"
+	"github.com/dapr/components-contrib/tests/certification/flow/app"
+	"github.com/dapr/components-contrib/tests/certification/flow/dockercompose"
+	"github.com/dapr/components-contrib/tests/certification/flow/retry"
+	"github.com/dapr/components-contrib/tests/certification/flow/sidecar"
+	"github.com/dapr/components-contrib/tests/certification/flow/watcher"
+
+	// AWS libraries
+	"github.com/aws/aws-sdk-go/aws"
+	//"github.com/aws/aws-sdk-go/aws/client"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/session"
+	//"github.com/aws/aws-sdk-go/service/sns"
+	//"github.com/aws/aws-sdk-go/service/sqs"
+	"github.com/aws/aws-sdk-go/service/sts"
 )
 
-type testFixture struct {
-	name                    string
-	endpoint                string
-	region                  string
-	profile                 string
-	topicName               string
-	deadLettersQueueName    string
-	messageReceiveLimit     string
-	queueName               string
-	accessKey               string
-	secretKey               string
-	sessionToken            string
-	fifo                    string
-	disableEntityManagement string
-}
+const (
+	sidecarName1      = "dapr-1"
+	sidecarName2      = "dapr-2"
+	sidecarName3      = "dapr-3"
+	appID1            = "app-1"
+	appID2            = "app-2"
+	appID3            = "app-3"
+	dockerComposeYAML = "docker-compose.yml"
+	numMessages       = 10
+	appPort           = 8000
+	portOffset        = 2
+	messageKey        = "partitionKey"
+	clusterName       = "snssqs"
+	pubsubName        = "snssqs"
+	topicName         = "topicName"
+)
 
-func getDefaultTestFixture(messageReceiveLimits ...string) *testFixture {
-	timestamp := strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
-	fixture := &testFixture{
-		region:                  os.Getenv("AWS_DEFAULT_REGION"),
-		accessKey:               os.Getenv("AWS_ACCESS_KEY_ID"),
-		secretKey:               os.Getenv("AWS_SECRET_ACCESS_KEY"),
-		endpoint:                os.Getenv("AWS_ENDPOINT_URL"),
-		profile:                 os.Getenv("AWS_PROFILE"),
-		sessionToken:            os.Getenv("AWS_SESSION_TOKEN"),
-		topicName:               fmt.Sprintf("dapr-sns-test-topic-%v", timestamp),
-		queueName:               fmt.Sprintf("dapr-sqs-test-queue-%v", timestamp),
-		disableEntityManagement: "false",
-		fifo:                    "false",
-	}
-
-	if len(messageReceiveLimits) > 0 {
-		fixture.deadLettersQueueName = fmt.Sprintf("dapr-sqs-test-deadletters-queue-%v", timestamp)
-		fixture.messageReceiveLimit = messageReceiveLimits[0]
-	}
-
-	return fixture
-}
-
-func newAWSSession(cfg *testFixture) *session.Session {
-	// run localstack and use the endpoint url: http://localhost:4566 by using the following cmd
-	// SERVICES=sns,sqs,sts DEBUG=1 localstack start
-	var mySession *session.Session
+func newLocalstackSession() *session.Session {
 	sessionCfg := aws.NewConfig()
-	// Create a client with additional configuration
-	if len(cfg.endpoint) != 0 {
-		sessionCfg.Endpoint = &cfg.endpoint
-		sessionCfg.Region = &cfg.region
-		sessionCfg.Credentials = credentials.NewStaticCredentials(cfg.accessKey, cfg.secretKey, "")
-		sessionCfg.DisableSSL = aws.Bool(true)
-
-		opts := session.Options{Profile: cfg.profile, Config: *sessionCfg}
-		mySession = session.Must(session.NewSessionWithOptions(opts))
-	} else {
-		sessionCfg.Region = aws.String(cfg.region)
-		opts := session.Options{SharedConfigState: session.SharedConfigEnable, Config: *sessionCfg}
-		mySession = session.Must(session.NewSessionWithOptions(opts))
-	}
-
+	sessionCfg.Endpoint = aws.String("http://localhost:4566")
+	sessionCfg.Region = aws.String("us-east-1")
+	sessionCfg.Credentials = credentials.NewStaticCredentials("my-accesskey", "my-secretkey", "")
+	sessionCfg.DisableSSL = aws.Bool(true)
+	opts := session.Options{Profile: "default", Config: *sessionCfg}
+	mySession := session.Must(session.NewSessionWithOptions(opts))
 	return mySession
 }
 
-func setupTest(t *testing.T, fixture *testFixture) (pubsub.PubSub, *session.Session) {
-	sess := newAWSSession(fixture)
-	assert.NotNil(t, sess)
-	t.Log("setup test")
+func TestAWSSnsSqs(t *testing.T) {
+	log := logger.NewLogger("dapr.components")
+	component := pubsub_loader.New("aws.snssqs", func() pubsub.PubSub {
+		return pubsub_snssqs.NewSnsSqs(log)
+	})
 
-	snssqsClient := snssqs.NewSnsSqs(logger.NewLogger("test"))
-	assert.NotNil(t, snssqsClient)
+	// For snssqs without FIFO, we don't have ordering guarantee
+	unorderedConsumerWatcher := watcher.NewUnordered()
 
-	props := map[string]string{
-		"region":                  fixture.region,
-		"accessKey":               fixture.accessKey,
-		"secretKey":               fixture.secretKey,
-		"endpoint":                fixture.endpoint,
-		"sessionToken":            fixture.sessionToken,
-		"consumerID":              fixture.queueName,
-		"fifo":                    fixture.fifo,
-		"disableEntityManagement": fixture.disableEntityManagement,
+	// Set the partition key on all messages so they
+	// are written to the same partition.
+	// This allows for checking of ordered messages.
+	metadata := map[string]string{
+		messageKey: "test",
 	}
 
-	if len(fixture.queueName) > 0 {
-		props["sqsQueueName"] = fixture.queueName
-	}
-	if len(fixture.deadLettersQueueName) > 0 {
-		props["sqsDeadLettersQueueName"] = fixture.deadLettersQueueName
-	}
-	if len(fixture.messageReceiveLimit) > 0 {
-		props["messageReceiveLimit"] = fixture.messageReceiveLimit
+	sendRecvTest := func(metadata map[string]string, messages ...*watcher.Watcher) flow.Runnable {
+		_, hasKey := metadata[messageKey]
+		return func(ctx flow.Context) error {
+			client := sidecar.GetClient(ctx, sidecarName1)
+
+			// Declare what is expected BEFORE performing any steps
+			// that will satisfy the test.
+			msgs := make([]string, numMessages)
+			for i := range msgs {
+				msgs[i] = fmt.Sprintf("Hello, Messages %03d", i)
+			}
+			for _, m := range messages {
+				m.ExpectStrings(msgs...)
+			}
+			// If no key it provided, create a random one.
+			// the topic's partitions.
+			if !hasKey {
+				metadata[messageKey] = uuid.NewString()
+			}
+
+			// Send events that the application above will observe.
+			ctx.Log("Sending messages!")
+			for _, msg := range msgs {
+				ctx.Logf("Sending: %q", msg)
+				err := client.PublishEvent(
+					ctx, pubsubName, topicName, msg,
+					dapr.PublishEventWithMetadata(metadata))
+				require.NoError(ctx, err, "error publishing message")
+			}
+
+			// Do the messages we observed match what we expect?
+			for _, m := range messages {
+				m.Assert(ctx, time.Minute)
+			}
+
+			return nil
+		}
 	}
 
-	pubsubMetadata := pubsub.Metadata{Properties: props}
+	// sendMessagesInBackground and assertMessages are
+	// Runnables for testing publishing and consuming
+	// messages reliably when infrastructure and network
+	// interruptions occur.
+	var task flow.AsyncTask
+	sendMessagesInBackground := func(messages ...*watcher.Watcher) flow.Runnable {
+		return func(ctx flow.Context) error {
+			client := sidecar.GetClient(ctx, sidecarName1)
+			for _, m := range messages {
+				m.Reset()
+			}
 
-	err := snssqsClient.Init(pubsubMetadata)
-	assert.Nil(t, err)
+			t := time.NewTicker(100 * time.Millisecond)
+			defer t.Stop()
 
-	return snssqsClient, sess
+			counter := 1
+			for {
+				select {
+				case <-task.Done():
+					return nil
+				case <-t.C:
+					msg := fmt.Sprintf("Background message - %03d", counter)
+					for _, m := range messages {
+						m.Prepare(msg) // Track for observation
+					}
+
+					// Publish with retries.
+					bo := backoff.WithContext(backoff.NewConstantBackOff(time.Second), task)
+					if err := kit_retry.NotifyRecover(func() error {
+						return client.PublishEvent(
+							// Using ctx instead of task here is deliberate.
+							// We don't want cancelation to prevent adding
+							// the message, only to interrupt between tries.
+							ctx, pubsubName, topicName, msg,
+							dapr.PublishEventWithMetadata(metadata))
+					}, bo, func(err error, t time.Duration) {
+						ctx.Logf("Error publishing message, retrying in %s", t)
+					}, func() {}); err == nil {
+						for _, m := range messages {
+							m.Add(msg) // Success
+						}
+						counter++
+					}
+				}
+			}
+		}
+	}
+	assertMessages := func(messages ...*watcher.Watcher) flow.Runnable {
+		return func(ctx flow.Context) error {
+			// Signal sendMessagesInBackground to stop and wait for it to complete.
+			task.CancelAndWait()
+			for _, m := range messages {
+				m.Assert(ctx, 5*time.Minute)
+			}
+
+			return nil
+		}
+	}
+	// Application logic that tracks messages from a topic.
+	application := func(messages *watcher.Watcher) app.SetupFn {
+		return func(ctx flow.Context, s common.Service) error {
+			// Simulate periodic errors.
+			sim := simulate.PeriodicError(ctx, 100)
+
+			// Setup the /orders event handler.
+			return multierr.Combine(
+				s.AddTopicEventHandler(&common.Subscription{
+					PubsubName: "snssqs",
+					Topic:      "topicName",
+					Route:      "/orders",
+				}, func(_ context.Context, e *common.TopicEvent) (retry bool, err error) {
+					if err := sim(); err != nil {
+						return true, err
+					}
+					// Track/Observe the data of the event.
+					messages.Observe(e.Data)
+					return false, nil
+				}),
+			)
+		}
+	}
+
+	flow.New(t, "aws pubsub snssqs certification (unordered)").
+		// Run Kafka using Docker Compose.
+		Step(dockercompose.Run(clusterName, dockerComposeYAML)).
+		Step("wait for localstack (AWS) readiness", retry.Do(5*time.Second, 30, waitForSTS)).
+		//
+		// Run the application logic above.
+		Step(app.Run(appID1, fmt.Sprintf(":%d", appPort),
+			application(unorderedConsumerWatcher))).
+		//
+		// Run the Dapr sidecar with the pubsub aws snssqs component.
+		Step(sidecar.Run(sidecarName1,
+			embedded.WithComponentsPath("./components/vanilla"),
+			embedded.WithAppProtocol(runtime.HTTPProtocol, appPort),
+			embedded.WithDaprGRPCPort(runtime.DefaultDaprAPIGRPCPort),
+			embedded.WithDaprHTTPPort(runtime.DefaultDaprHTTPPort),
+			runtime.WithPubSubs(component))).
+		//
+		// Run the second application.
+		Step(app.Run(appID2, fmt.Sprintf(":%d", appPort+portOffset),
+			application(unorderedConsumerWatcher))).
+		//
+		// Run the Dapr sidecar with the Kafka component.
+		Step(sidecar.Run(sidecarName2,
+			embedded.WithComponentsPath("./components/vanilla"),
+			embedded.WithAppProtocol(runtime.HTTPProtocol, appPort+portOffset),
+			embedded.WithDaprGRPCPort(runtime.DefaultDaprAPIGRPCPort+portOffset),
+			embedded.WithDaprHTTPPort(runtime.DefaultDaprHTTPPort+portOffset),
+			embedded.WithProfilePort(runtime.DefaultProfilePort+portOffset),
+			runtime.WithPubSubs(component))).
+		//
+		// Send messages using the same metadata/message keys
+		Step("send and wait", sendRecvTest(metadata, unorderedConsumerWatcher)).
+		//
+		// Run the third application.
+		Step(app.Run(appID3, fmt.Sprintf(":%d", appPort+portOffset*2),
+			application(unorderedConsumerWatcher))).
+		//
+		// Run the Dapr sidecar with the snssqs component.
+		Step(sidecar.Run(sidecarName3,
+			embedded.WithComponentsPath("./components/vanilla"),
+			embedded.WithAppProtocol(runtime.HTTPProtocol, appPort+portOffset*2),
+			embedded.WithDaprGRPCPort(runtime.DefaultDaprAPIGRPCPort+portOffset*2),
+			embedded.WithDaprHTTPPort(runtime.DefaultDaprHTTPPort+portOffset*2),
+			embedded.WithProfilePort(runtime.DefaultProfilePort+portOffset*2),
+			runtime.WithPubSubs(component))).
+		Step("reset", flow.Reset(unorderedConsumerWatcher)).
+		//
+		// Send messages with random keys to test message consumption
+		// across more than one consumer group and consumers per group.
+		Step("send and wait", sendRecvTest(map[string]string{}, unorderedConsumerWatcher)).
+		//
+		// This tests the components' ability to handle reconnections
+		// when sns and sqs are shutdown cleanly.
+		StepAsync("steady flow of messages to publish", &task,
+			sendMessagesInBackground(unorderedConsumerWatcher)).
+		Step("stop sns sqs cluster", dockercompose.Stop(clusterName, dockerComposeYAML, "snssqs")).
+		Step("wait", flow.Sleep(5*time.Second)).
+		Step("restart sns sqs cluster", dockercompose.Start(clusterName, dockerComposeYAML, "snssqs")).
+		Step("wait for localstack (AWS) readiness", retry.Do(5*time.Second, 30, waitForSTS)).
+		Step("assert messages", assertMessages(unorderedConsumerWatcher)).
+		Step("reset", flow.Reset(unorderedConsumerWatcher)).
+
+		/*//
+		// Simulate a network interruption.
+		// This tests the components' ability to handle reconnections
+		// when Dapr is disconnected abnormally.
+		StepAsync("steady flow of messages to publish", &task,
+			sendMessagesInBackground(unorderedConsumerWatcher)).
+		Step("wait", flow.Sleep(5*time.Second)).
+
+		// Errors will occur here.
+		Step("interrupt network",
+			network.InterruptNetwork(1*time.Second, nil, nil, "4566")).
+		//
+		// Component should recover at this point.
+		Step("wait", flow.Sleep(5*time.Second)).
+		Step("assert messages", assertMessages(unorderedConsumerWatcher)).
+		*/
+		//
+		// Shutdown
+		Step("reset", flow.Reset(unorderedConsumerWatcher)).
+		Step("wait", flow.Sleep(15*time.Second)).
+		Step("stop sidecar 1", sidecar.Stop(sidecarName1)).
+		Step("wait", flow.Sleep(3*time.Second)).
+		Step("stop app 1", app.Stop(appID1)).
+		Step("wait", flow.Sleep(10*time.Second)).
+		Step("stop sidecar 2", sidecar.Stop(sidecarName2)).
+		Step("wait", flow.Sleep(3*time.Second)).
+		Step("stop app 2", app.Stop(appID2)).
+		Step("wait", flow.Sleep(10*time.Second)).
+		Step("stop sidecar 3", sidecar.Stop(sidecarName3)).
+		Step("wait", flow.Sleep(3*time.Second)).
+		Step("stop app 3", app.Stop(appID3)).
+		Step("wait", flow.Sleep(10*time.Second)).
+		Step("stop sns sqs cluster", dockercompose.Stop(clusterName, dockerComposeYAML, "snssqs")).
+		Step("wait", flow.Sleep(5*time.Second)).
+		Run()
 }
 
-func getAccountID(sess client.ConfigProvider) (*sts.GetCallerIdentityOutput, error) {
+func TestAWSSnsSqsDeadletters(t *testing.T) {
+	log := logger.NewLogger("dapr.components")
+	component := pubsub_loader.New("aws.snssqs", func() pubsub.PubSub {
+		return pubsub_snssqs.NewSnsSqs(log)
+	})
+
+	// For snssqs without FIFO, we don't have ordering guarantee
+	unorderedConsumerWatcher := watcher.NewUnordered()
+	dlqUnorderedConsumerWatcher := watcher.NewUnordered()
+
+	// Set the partition key on all messages so they
+	// are written to the same partition.
+	// This allows for checking of ordered messages.
+	metadata := map[string]string{
+		messageKey: "test",
+	}
+
+	sendRecvTest := func(metadata map[string]string, messages ...*watcher.Watcher) flow.Runnable {
+		_, hasKey := metadata[messageKey]
+		return func(ctx flow.Context) error {
+			client := sidecar.GetClient(ctx, sidecarName1)
+
+			// Declare what is expected BEFORE performing any steps
+			// that will satisfy the test.
+			// Here we expect nothing to be present in the ack'ed messages as they would fail
+			msgs := make([]string, numMessages)
+			for i := range msgs {
+				msgs[i] = fmt.Sprintf("Hello, Messages %03d", i)
+			}
+
+			for _, m := range messages {
+				m.ExpectStrings(msgs...)
+			}
+			// If no key it provided, create a random one.
+			// For Kafka, this will spread messages across
+			// the topic's partitions.
+			if !hasKey {
+				metadata[messageKey] = uuid.NewString()
+			}
+
+			// Send events that the receiveFailingApplication above will observe.
+			ctx.Log("Sending messages!")
+			for _, msg := range msgs {
+				ctx.Logf("Sending: %q", msg)
+				err := client.PublishEvent(
+					ctx, pubsubName, topicName, msg,
+					dapr.PublishEventWithMetadata(metadata))
+				require.NoError(ctx, err, "error publishing message")
+			}
+
+			// Do the messages we observed match what we expect?
+			for _, m := range messages {
+				m.Assert(t, time.Minute)
+			}
+
+			return nil
+		}
+	}
+
+	// Application logic that fails messages from a topic.
+	receiveFailingApplication := func(messages *watcher.Watcher) app.SetupFn {
+		return func(ctx flow.Context, s common.Service) error {
+
+			// Setup the /orders event handler.
+			return multierr.Combine(
+				s.AddTopicEventHandler(&common.Subscription{
+					PubsubName: "snssqs",
+					Topic:      "topicName",
+					Route:      "/orders",
+				}, func(_ context.Context, e *common.TopicEvent) (retry bool, err error) {
+
+					// always fail to process message
+					messages.Observe(e.Data)
+					return false, fmt.Errorf("simulating consumer error")
+				}),
+			)
+		}
+	}
+
+	// Application logic that tracks DLQ messages from a topic.
+	application := func(messages *watcher.Watcher) app.SetupFn {
+		return func(ctx flow.Context, s common.Service) error {
+
+			// Setup the /orders event handler.
+			return multierr.Combine(
+				s.AddTopicEventHandler(&common.Subscription{
+					PubsubName: "snssqs",
+					Topic:      "topicName",
+					Route:      "/orders",
+				}, func(_ context.Context, e *common.TopicEvent) (retry bool, err error) {
+					// always fail to process message
+					messages.Observe(e.Data)
+					fmt.Printf("\napplication handled data. source: %s, data: %s, id: %s\n", e.Source, e.Data, e.ID)
+					return false, nil
+				}),
+			)
+		}
+	}
+
+	flow.New(t, "aws pubsub snssqs certification (unordered)").
+		// Run Kafka using Docker Compose.
+		Step(dockercompose.Run(clusterName, dockerComposeYAML)).
+		Step("wait for localstack (AWS) readiness", retry.Do(time.Second, 30, waitForSTS)).
+		//
+		// Run the receiveFailingApplication logic above.
+		Step(app.Run(appID1, fmt.Sprintf(":%d", appPort),
+			receiveFailingApplication(unorderedConsumerWatcher))).
+		//
+		// Run the Dapr sidecar with the pubsub aws snssqs component.
+		Step(sidecar.Run(sidecarName1,
+			embedded.WithComponentsPath("./components/deadletters/alpha"),
+			embedded.WithAppProtocol(runtime.HTTPProtocol, appPort),
+			embedded.WithDaprGRPCPort(runtime.DefaultDaprAPIGRPCPort),
+			embedded.WithDaprHTTPPort(runtime.DefaultDaprHTTPPort),
+			runtime.WithPubSubs(component))).
+		//
+		// Run the second receiveFailingApplication.
+		Step(app.Run(appID2, fmt.Sprintf(":%d", appPort+portOffset),
+			receiveFailingApplication(unorderedConsumerWatcher))).
+		//
+		// Run the Dapr sidecar with the component.
+		Step(sidecar.Run(sidecarName2,
+			embedded.WithComponentsPath("./components/deadletters/alpha"),
+			embedded.WithAppProtocol(runtime.HTTPProtocol, appPort+portOffset),
+			embedded.WithDaprGRPCPort(runtime.DefaultDaprAPIGRPCPort+portOffset),
+			embedded.WithDaprHTTPPort(runtime.DefaultDaprHTTPPort+portOffset),
+			embedded.WithProfilePort(runtime.DefaultProfilePort+portOffset),
+			runtime.WithPubSubs(component))).
+
+		// Run the third application.
+		Step(app.Run(appID3, fmt.Sprintf(":%d", appPort+portOffset*2),
+			application(dlqUnorderedConsumerWatcher))).
+		//
+		// Run the Dapr sidecar with the component.
+		Step(sidecar.Run(sidecarName3,
+			// using a component that would consume messages sent to the deadletters queue
+			embedded.WithComponentsPath("./components/deadletters/beta"),
+			embedded.WithAppProtocol(runtime.HTTPProtocol, appPort+portOffset*2),
+			embedded.WithDaprGRPCPort(runtime.DefaultDaprAPIGRPCPort+portOffset*2),
+			embedded.WithDaprHTTPPort(runtime.DefaultDaprHTTPPort+portOffset*2),
+			embedded.WithProfilePort(runtime.DefaultProfilePort+portOffset*2),
+			runtime.WithPubSubs(component))).
+		// Send messages using the same metadata/message keys
+		Step("send and wait", sendRecvTest(metadata, unorderedConsumerWatcher, dlqUnorderedConsumerWatcher)).
+		//Step("wait", flow.Sleep(30*time.Second)).
+		//Step("stop app1", sidecar.Stop(appID1)).
+		//Step("stop app2", sidecar.Stop(appID2)).
+		//Step("stop app3", sidecar.Stop(appID3)).
+		Run()
+}
+
+func waitForSTS(ctx flow.Context) error {
+	sess := newLocalstackSession()
 	svc := sts.New(sess)
 	input := &sts.GetCallerIdentityInput{}
 
-	result, err := svc.GetCallerIdentity(input)
+	callerIdentityOutput, err := svc.GetCallerIdentity(input)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	return result, err
+	if *callerIdentityOutput.Account != "000000000000" {
+		return fmt.Errorf("account is not as expected: %s", *callerIdentityOutput.Account)
+	}
+
+	return nil
 }
-
-func getQueueURL(sess client.ConfigProvider, queueName *string) (*sqs.GetQueueUrlOutput, error) {
-	// Get the account ID
-	accountResult, aErr := getAccountID(sess)
-	if aErr != nil {
-		return nil, aErr
-	}
-
-	// Create an SQS service client
-	svc := sqs.New(sess)
-	result, err := svc.GetQueueUrl(&sqs.GetQueueUrlInput{
-		QueueName:              queueName,
-		QueueOwnerAWSAccountId: accountResult.Account,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return result, nil
-}
-
-func teardownSqs(t *testing.T, sess client.ConfigProvider, fixture *testFixture) {
-	svc := sqs.New(sess)
-	queueName := snssqs.NameToAWSSanitizedName(fixture.queueName)
-	queueURL, err := getQueueURL(sess, &queueName)
-	assert.Nil(t, err)
-	assert.NotNil(t, queueURL)
-
-	_, err = svc.DeleteQueue(&sqs.DeleteQueueInput{
-		QueueUrl: queueURL.QueueUrl,
-	})
-	assert.Nil(t, err)
-
-	if len(fixture.deadLettersQueueName) > 0 {
-		dlqName := snssqs.NameToAWSSanitizedName(fixture.deadLettersQueueName)
-		deleteQueue(svc, sess, dlqName)
-	}
-	deleteQueue(svc, sess, fixture.queueName)
-}
-
-func deleteQueue(svc *sqs.SQS, sess client.ConfigProvider, name string) {
-	dlQueueURL, err := getQueueURL(sess, &name)
-	// err would exist if no dead-letter queue exist, which might be the case
-	// in some tests
-	if err != nil {
-		return
-	}
-
-	svc.DeleteQueue(&sqs.DeleteQueueInput{
-		QueueUrl: dlQueueURL.QueueUrl,
-	})
-}
-
-func teardownSns(t *testing.T, sess client.ConfigProvider, fixture *testFixture) {
-	svc := sns.New(sess)
-	result, err := svc.ListTopics(nil)
-	assert.Nil(t, err)
-	assert.NotNil(t, result)
-
-	var accountID *sts.GetCallerIdentityOutput
-	accountID, err = getAccountID(sess)
-	assert.Nil(t, err)
-	assert.NotNil(t, accountID)
-
-	topic := snssqs.NameToAWSSanitizedName(fixture.topicName)
-	lookupTopicArn := fmt.Sprintf("arn:aws:sns:%v:%v:%v", fixture.region, *accountID.Account, topic)
-	for _, topic := range result.Topics {
-		if *topic.TopicArn == lookupTopicArn {
-			// deletes topic
-			// currently there is a bug in aws-go-sdk that results in the subscription not being
-			// deleted along with the topic (as should be) so the subscription needs
-			// to be manually deleted
-			svc.DeleteTopic(&sns.DeleteTopicInput{TopicArn: topic.TopicArn})
-		}
-	}
-}
-
-func snsSqsTest(t *testing.T, sess client.ConfigProvider, snssqsClient pubsub.PubSub, fixture *testFixture) func(t *testing.T, teardown bool) {
-	// subscriber registers to listen to (SNS) topic which eventually land on the fixture.queueName
-	// over (SQS) queue
-	req := pubsub.SubscribeRequest{Topic: fixture.topicName}
-	msgsChan := make(chan *pubsub.NewMessage)
-	handler := func(ctx context.Context, msg *pubsub.NewMessage) error {
-		msgsChan <- msg
-		fmt.Printf("test message received, from topic %v\n", msg.Topic)
-		return nil
-	}
-
-	err := snssqsClient.Subscribe(req, handler)
-	assert.Nil(t, err)
-
-	var queueURL *sqs.GetQueueUrlOutput
-	queueName := snssqs.NameToAWSSanitizedName(fixture.queueName)
-	queueURL, err = getQueueURL(sess, &queueName)
-	// check queue was created before publish
-	assert.Nil(t, err)
-	assert.NotNil(t, queueURL)
-
-	publishReq := &pubsub.PublishRequest{Topic: fixture.topicName, PubsubName: "test", Data: []byte(fmt.Sprintf("message from topic: %s, through queue: %s", fixture.topicName, queueName))}
-	err = snssqsClient.Publish(publishReq)
-	assert.Nil(t, err)
-	// wait till received between send/recv in sqs
-
-	// tear down callback
-	return func(t *testing.T, teardown bool) {
-		<-msgsChan
-		if teardown {
-			teardownSqs(t, sess, fixture)
-			teardownSns(t, sess, fixture)
-		}
-
-		t.Log("teardown test")
-	}
-}
-
-func snsSqsDeadlettersTest(t *testing.T, sess client.ConfigProvider, snssqsClient pubsub.PubSub, fixture *testFixture) func(t *testing.T) {
-	// subscriber's handlers always fails to process message forcing dead letters queue to
-	req := pubsub.SubscribeRequest{Topic: fixture.topicName}
-	msgArrived := make(chan interface{})
-	handler := func(ctx context.Context, msg *pubsub.NewMessage) error {
-		msgArrived <- nil
-		return fmt.Errorf("simulating failure to consume to test message movement to deadletters")
-	}
-
-	err := snssqsClient.Subscribe(req, handler)
-	assert.Nil(t, err)
-
-	var queueURL *sqs.GetQueueUrlOutput
-	queueURL, err = getQueueURL(sess, &fixture.queueName)
-	assert.Nil(t, err)
-	assert.NotNil(t, queueURL)
-
-	publishReq := &pubsub.PublishRequest{Topic: fixture.topicName, PubsubName: "test", Data: []byte("string")}
-	err = snssqsClient.Publish(publishReq)
-	assert.Nil(t, err)
-
-	// tear down callback
-	return func(t *testing.T) {
-		sqsSvc := sqs.New(sess)
-		dlQueueURL, err := getQueueURL(sess, &fixture.deadLettersQueueName)
-		assert.Nil(t, err)
-		assert.NotNil(t, dlQueueURL)
-
-		var output *sqs.ReceiveMessageOutput
-		<-msgArrived
-
-		for i := 0; i < 5; i++ {
-			output, err = sqsSvc.ReceiveMessage(&sqs.ReceiveMessageInput{
-				AttributeNames: []*string{
-					aws.String(sqs.MessageSystemAttributeNameSentTimestamp),
-				},
-				MessageAttributeNames: []*string{
-					aws.String(sqs.QueueAttributeNameAll),
-				},
-				QueueUrl:            dlQueueURL.QueueUrl,
-				MaxNumberOfMessages: aws.Int64(1),
-				VisibilityTimeout:   aws.Int64(1),
-				WaitTimeSeconds:     aws.Int64(1),
-			})
-			time.Sleep(1 * time.Second)
-			if err != nil || (output != nil && len(output.Messages) > 0) {
-				break
-			}
-		}
-
-		assert.Nil(t, err)
-		assert.NotNil(t, output)
-		assert.NotNil(t, output.Messages)
-		assert.Len(t, output.Messages, 1)
-
-		teardownSqs(t, sess, fixture)
-		teardownSns(t, sess, fixture)
-
-		t.Log("teardown test")
-	}
-}
-
-func TestMain(m *testing.M) {
-	code := m.Run()
-	os.Exit(code)
-}
-
-func TestSnsSqs(t *testing.T) {
-	t.Parallel()
-
-	fixture := getDefaultTestFixture()
-	if (len(fixture.accessKey) == 0 && len(fixture.secretKey) == 0) && len(fixture.sessionToken) == 0 {
-		t.Skip(
-			`environment variables of either AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
-            or AWS_SESSION_TOKEN must be set in order to run these integration
-            tests
-            `)
-	}
-	client, sess := setupTest(t, fixture)
-	teardownSnsSqsTest := snsSqsTest(t, sess, client, fixture)
-	teardownSnsSqsTest(t, true)
-}
-
-/* func TestSnsSqsNoResourceCreation(t *testing.T) {
-	t.Parallel()
-
-	fixture := getDefaultTestFixture()
-	fixture.topicName = "dapr-test-topic"
-	fixture.queueName = "dapr-test-queue"
-	if (len(fixture.accessKey) == 0 && len(fixture.secretKey) == 0) && len(fixture.sessionToken) == 0 {
-		t.Skip(
-			`environment variables of either AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
-            or AWS_SESSION_TOKEN must be set in order to run these integration
-            tests
-            `)
-	}
-	client, sess := setupTest(t, fixture)
-	// test but no teardown
-	teardown := snsSqsTest(t, sess, client, fixture)
-	teardown(t, false)
-
-	// "lock" entity creation and should use existing resources
-	fixture.disableEntityManagement = "true"
-	client, sess = setupTest(t, fixture)
-
-	teardownSnsSqsTest := snsSqsTest(t, sess, client, fixture)
-	teardownSnsSqsTest(t, true)
-} */
-
-func TestSnsSqs2Topics1Queue(t *testing.T) {
-	t.Parallel()
-
-	fixture := getDefaultTestFixture()
-	fixture.topicName = "dapr-test-topic"
-	fixture.queueName = "dapr-test-queue"
-	if (len(fixture.accessKey) == 0 && len(fixture.secretKey) == 0) && len(fixture.sessionToken) == 0 {
-		t.Skip(
-			`environment variables of either AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY 
-            or AWS_SESSION_TOKEN must be set in order to run these integration
-            tests
-            `)
-	}
-	client, sess := setupTest(t, fixture)
-	// test but no teardown
-	teardown := snsSqsTest(t, sess, client, fixture)
-	teardown(t, false)
-
-	// only new topic should be created
-	fixture.topicName = "dapr-test-topic2"
-	client, sess = setupTest(t, fixture)
-	teardown = snsSqsTest(t, sess, client, fixture)
-	teardown(t, true)
-}
-
-func TestSnsSqsNameSanitization(t *testing.T) {
-	t.Parallel()
-
-	fixture := getDefaultTestFixture()
-	fixture.topicName = "dapr-test-&*()*&&^topic-sanitized"
-	fixture.queueName = "dapr-test-&*()*&&^queue-sanitized"
-	if (len(fixture.accessKey) == 0 && len(fixture.secretKey) == 0) && len(fixture.sessionToken) == 0 {
-		t.Skip(
-			`environment variables of either AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
-            or AWS_SESSION_TOKEN must be set in order to run these integration
-            tests
-            `)
-	}
-	client, sess := setupTest(t, fixture)
-	teardownSnsSqsTest := snsSqsTest(t, sess, client, fixture)
-	teardownSnsSqsTest(t, true)
-}
-
-// func TestSnsSqsFifo(t *testing.T) {
-// 	t.Parallel()
-
-// 	fixture := getDefaultTestFixture()
-// 	fixture.fifo = "true"
-// 	fixture.topicName += ".fifo"
-// 	fixture.queueName += ".fifo"
-// 	if (len(fixture.accessKey) == 0 && len(fixture.secretKey) == 0) && len(fixture.sessionToken) == 0 {
-// 		t.Skip(
-// 			`environment variables of either AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
-//             or AWS_SESSION_TOKEN must be set in order to run these integration
-//             tests
-//             `)
-// 	}
-// 	client, sess := setupTest(t, fixture)
-// 	teardownSnsSqsTest := snsSqsTest(t, sess, client, fixture)
-// 	defer teardownSnsSqsTest(t)
-// }
-
-func TestSnsSqsWithDLQ(t *testing.T) {
-	t.Parallel()
-
-	fixture := getDefaultTestFixture("1")
-	if (len(fixture.accessKey) == 0 && len(fixture.secretKey) == 0) && len(fixture.sessionToken) == 0 {
-		t.Skip(
-			`environment variables of either AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
-            or AWS_SESSION_TOKEN must be set in order to run these integration
-            tests
-            `)
-	}
-	client, sess := setupTest(t, fixture)
-	teardownSnsSqsTest := snsSqsDeadlettersTest(t, sess, client, fixture)
-	teardownSnsSqsTest(t)
-}
-
-// func TestSnsSqsWithDLQFifo(t *testing.T) {
-// 	t.Parallel()
-
-// 	fixture := getDefaultTestFixture("1")
-// 	fixture.fifo = "true"
-// 	fixture.topicName += ".fifo"
-// 	fixture.queueName += ".fifo"
-// 	fixture.deadLettersQueueName += ".fifo"
-
-// 	if (len(fixture.accessKey) == 0 && len(fixture.secretKey) == 0) && len(fixture.sessionToken) == 0 {
-// 		t.Skip(
-// 			`environment variables of either AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
-//             or AWS_SESSION_TOKEN must be set in order to run these integration
-//             tests
-//             `)
-// 	}
-// 	client, sess := setupTest(t, fixture)
-// 	teardownSnsSqsTest := snsSqsDeadlettersTest(t, sess, client, fixture)
-// 	defer teardownSnsSqsTest(t)
-// }
