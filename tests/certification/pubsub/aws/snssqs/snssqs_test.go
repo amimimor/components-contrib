@@ -9,7 +9,6 @@ import (
 	"context"
 	"fmt"
 	"github.com/cenkalti/backoff/v4"
-	"github.com/dapr/components-contrib/tests/certification/flow/network"
 	"github.com/dapr/components-contrib/tests/certification/flow/simulate"
 	kit_retry "github.com/dapr/kit/retry"
 
@@ -269,10 +268,10 @@ func TestAWSSnsSqs(t *testing.T) {
 		// when sns and sqs are shutdown cleanly.
 		StepAsync("steady flow of messages to publish", &task,
 			sendMessagesInBackground(unorderedConsumerWatcher)).
-		Step("stop sns sqs cluster", dockercompose.Stop(clusterName, dockerComposeYAML, "snssqs")).
-		Step("wait", flow.Sleep(5*time.Second)).
-		Step("restart sns sqs cluster", dockercompose.Start(clusterName, dockerComposeYAML, "snssqs")).
-		Step("wait for localstack (AWS) readiness", retry.Do(5*time.Second, 30, waitForSTS)).
+		Step("stop sns sqs cluster", dockercompose.Stop(clusterName, dockerComposeYAML)).
+		Step("wait", flow.Sleep(10*time.Second)).
+		Step("restart sns sqs cluster", dockercompose.Start(clusterName, dockerComposeYAML)).
+		Step("wait for localstack (AWS) readiness", retry.Do(30*time.Second, 30, waitForSTS)).
 		Step("assert messages", assertMessages(unorderedConsumerWatcher)).
 		Step("reset", flow.Reset(unorderedConsumerWatcher)).
 
@@ -280,22 +279,22 @@ func TestAWSSnsSqs(t *testing.T) {
 		// Simulate a network interruption.
 		// This tests the components' ability to handle reconnections
 		// when Dapr is disconnected abnormally.
-		StepAsync("steady flow of messages to publish", &task,
-			sendMessagesInBackground(unorderedConsumerWatcher)).
-		Step("wait", flow.Sleep(5*time.Second)).
+		//StepAsync("steady flow of messages to publish", &task,
+		//	sendMessagesInBackground(unorderedConsumerWatcher)).
+		//Step("wait", flow.Sleep(5*time.Second)).
 
 		// Errors will occur here.
-		Step("interrupt network",
-			network.InterruptNetwork(1*time.Second, nil, nil, "4566")).
+		//Step("interrupt network",
+		//	network.InterruptNetwork(1*time.Second, nil, nil, "4566")).
 		//
 		// Component should recover at this point.
-		Step("wait", flow.Sleep(5*time.Second)).
-		Step("assert messages", assertMessages(unorderedConsumerWatcher)).
+		//Step("wait", flow.Sleep(5*time.Second)).
+		//Step("assert messages", assertMessages(unorderedConsumerWatcher)).
 
 		//
 		// Shutdown
-		Step("reset", flow.Reset(unorderedConsumerWatcher)).
-		Step("wait", flow.Sleep(15*time.Second)).
+		//Step("reset", flow.Reset(unorderedConsumerWatcher)).
+		//Step("wait", flow.Sleep(3*time.Second)).
 		Step("stop sidecar 1", sidecar.Stop(sidecarName1)).
 		Step("wait", flow.Sleep(3*time.Second)).
 		Step("stop app 1", app.Stop(appID1)).
@@ -469,13 +468,9 @@ func waitForSTS(ctx flow.Context) error {
 	svc := sts.New(sess)
 	input := &sts.GetCallerIdentityInput{}
 
-	callerIdentityOutput, err := svc.GetCallerIdentity(input)
+	_, err := svc.GetCallerIdentity(input)
 	if err != nil {
 		return err
-	}
-
-	if *callerIdentityOutput.Account != "000000000000" {
-		return fmt.Errorf("account is not as expected: %s", *callerIdentityOutput.Account)
 	}
 
 	return nil

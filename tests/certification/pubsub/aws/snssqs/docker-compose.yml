@@ -4,7 +4,39 @@ services:
     image: localstack/localstack:0.11.2
     container_name: snssqs
     environment:
-      SERVICES: "sns,sqs,sts"
+      SERVICES: sns,sqs,sts
       DEBUG: 1
+      HOST_TMP_FOLDER: "${TMPDIR:-/tmp}"
+      DATA_DIR: "${TMPDIR:-/tmp}/localstack/data"
+      LAMBDA_REMOTE_DOCKER: 1
+
     ports:
       - 4566:4566
+    volumes:
+      - "${TMPDIR:-/tmp}/localstack:/tmp/localstack"
+
+
+#  awscli:
+#    image: garland/aws-cli-docker
+#    container_name: awscli
+#    depends_on:
+#      - snssqs
+#    environment:
+#      - AWS_DEFAULT_REGION=eu-east-1
+#      - AWS_ACCESS_KEY_ID=xxx
+#      - AWS_SECRET_ACCESS_KEY=xxx
+#    command:
+#      - /bin/sh
+#      - -c
+#      - |
+#        sleep 20
+#        aws --endpoint-url=http://localstack:4566 sns create-topic --name topicName
+#        aws --endpoint-url=http://localstack:4566 sqs create-queue --queue-name app-1
+#        aws --endpoint-url=http://localstack:4566 sns subscribe --topic-arn arn:aws:sns:eu-east-1:000000000000:topicName --protocol sqs --notification-endpoint arn:aws:sqs:us-east-1:000000000000:app-1
+#        aws --endpoint-url=http://localstack:4566 sqs create-queue --queue-name app-2
+#        aws --endpoint-url=http://localstack:4566 sns subscribe --topic-arn arn:aws:sns:eu-east-1:000000000000:topicName --protocol sqs --notification-endpoint arn:aws:sqs:us-east-1:000000000000:app-2
+#        aws --endpoint-url=http://localstack:4566 sqs create-queue --queue-name app-3
+#        aws --endpoint-url=http://localstack:4566 sns subscribe --topic-arn arn:aws:sns:eu-east-1:000000000000:topicName --protocol sqs --notification-endpoint arn:aws:sqs:us-east-1:000000000000:app-3
+
+  
+
