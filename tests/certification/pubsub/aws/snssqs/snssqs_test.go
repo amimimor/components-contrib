@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/cenkalti/backoff/v4"
+	"github.com/dapr/components-contrib/tests/certification/flow/network"
 	"github.com/dapr/components-contrib/tests/certification/flow/simulate"
 	kit_retry "github.com/dapr/kit/retry"
 
@@ -275,7 +276,7 @@ func TestAWSSnsSqs(t *testing.T) {
 		Step("assert messages", assertMessages(unorderedConsumerWatcher)).
 		Step("reset", flow.Reset(unorderedConsumerWatcher)).
 
-		/*//
+		//
 		// Simulate a network interruption.
 		// This tests the components' ability to handle reconnections
 		// when Dapr is disconnected abnormally.
@@ -290,7 +291,7 @@ func TestAWSSnsSqs(t *testing.T) {
 		// Component should recover at this point.
 		Step("wait", flow.Sleep(5*time.Second)).
 		Step("assert messages", assertMessages(unorderedConsumerWatcher)).
-		*/
+
 		//
 		// Shutdown
 		Step("reset", flow.Reset(unorderedConsumerWatcher)).
