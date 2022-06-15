@@ -21,6 +21,7 @@ import (
 
 func GetClient(accessKey string, secretKey string, sessionToken string, region string, endpoint string) (*session.Session, error) {
 	awsConfig := aws.NewConfig()
+	awsConfig.CredentialsChainVerboseErrors = aws.Bool(true)
 
 	if region != "" {
 		awsConfig = awsConfig.WithRegion(region)
